@@ -1,420 +1,393 @@
+'use strict';
+
 /**
- * BCM — Secret Messages Backend
- * Pure Node.js, no external dependencies
- * Run: node server.js
+ * BCM — Black Coin Messages
+ * Express backend: auth, messages, redeem
+ *
+ * Data is stored in-process (Map/Object) by default.
+ * Swap the "DB" section for a real DB (SQLite, Postgres, etc.) when ready.
+ *
+ * Endpoints:
+ *   POST /auth/register      { pin }            → { token, login_id }
+ *   POST /auth/login         { login_id, pin }  → { token, login_id }
+ *   GET  /profile            (auth)             → profile + stats
+ *   GET  /messages           (auth)             → { messages: [...] }
+ *   POST /messages/text      (auth)             → { redemption_code }
+ *   POST /messages/media     (auth, multipart)  → { redemption_code }
+ *   POST /redeem             (auth) { code }    → message content
  */
 
-const http = require('http');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const url = require('url');
+const express  = require('express');
+const cors     = require('cors');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const multer   = require('multer');
+const path     = require('path');
+const fs       = require('fs');
+const { v4: uuidv4 } = require('uuid');
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
-const DB_FILE = path.join(__dirname, 'data', 'db.json');
-const UPLOADS_DIR = path.join(__dirname, 'data', 'uploads');
-const MAX_BODY = 20 * 1024 * 1024; // 20 MB
+const PORT       = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'bcm-super-secret-change-in-prod';
+const BCRYPT_ROUNDS = 10;
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const MAX_FILE_MB = 20;
 
-// ── ENSURE DATA DIRS ──────────────────────────────────────────────────────────
-fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// ── DB HELPERS ────────────────────────────────────────────────────────────────
-function loadDB() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch {
-    return { users: {}, messages: {}, redemptions: [] };
-  }
-}
+// ── IN-MEMORY "DB" ────────────────────────────────────────────────────────────
+// Replace these Maps with real DB queries as needed.
+/** @type {Map<string, {id,login_id,pin_hash,created_at}>} */
+const users = new Map();
 
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
+/** @type {Map<string, {id,user_id,message_type,text_content?,file_path?,
+ *                      one_time_view,expiry_at,created_at,redeemed,redeemed_at?}>} */
+const messages = new Map();
 
-// ── CRYPTO HELPERS ────────────────────────────────────────────────────────────
-function uuid() {
-  return crypto.randomUUID();
-}
+/** @type {Map<string, string>}  code → message_id */
+const codeIndex = new Map();
 
-function hashPin(pin) {
-  return crypto.createHash('sha256').update('bcm_salt_' + pin).digest('hex');
-}
+// ── HELPERS ───────────────────────────────────────────────────────────────────
 
-function checkPin(pin, hash) {
-  return hashPin(pin) === hash;
-}
-
-function signJWT(payload) {
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const body = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString('base64url');
-  const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
-  return `${header}.${body}.${sig}`;
-}
-
-function verifyJWT(token) {
-  try {
-    const [header, body, sig] = token.split('.');
-    const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
-    if (sig !== expected) return null;
-    return JSON.parse(Buffer.from(body, 'base64url').toString());
-  } catch {
-    return null;
-  }
-}
-
-// ── WORD LIST FOR LOGIN IDs ───────────────────────────────────────────────────
-const ADJECTIVES = ['Silent','Shadow','Iron','Crimson','Jade','Neon','Phantom','Steel','Obsidian','Amber','Cobalt','Violet','Onyx','Silver','Ghost','Cipher','Raven','Storm','Frost','Ember'];
-const NOUNS = ['Falcon','Cipher','Wolf','Dagger','Viper','Sphinx','Raven','Lynx','Hawk','Cobra','Fox','Tiger','Bear','Eagle','Shark','Panther','Scorpion','Dragon','Phoenix','Wraith'];
-
-function uniqueLoginId() {
-  const db = loadDB();
-  const existing = new Set(Object.values(db.users).map(u => u.login_id));
-  let id;
-  do {
-    const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-    const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
-    const num = Math.floor(10 + Math.random() * 90);
-    id = `${adj}${noun}${num}`;
-  } while (existing.has(id));
+/** Generate a random adjective-noun style login_id, e.g. "swift-falcon-42" */
+function generateLoginId() {
+  const adj  = ['swift','silent','dark','golden','iron','shadow','jade','velvet','obsidian','ember'];
+  const noun = ['falcon','specter','wolf','raven','cipher','herald','echo','prism','vault','nexus'];
+  const num  = Math.floor(Math.random() * 90) + 10;
+  const id   = `${adj[Math.floor(Math.random()*adj.length)]}-${noun[Math.floor(Math.random()*noun.length)]}-${num}`;
+  // Ensure uniqueness
+  for (const u of users.values()) if (u.login_id === id) return generateLoginId();
   return id;
 }
 
-function uniqueCode() {
-  const db = loadDB();
-  const existing = new Set(Object.values(db.messages).map(m => m.redemption_code));
-  let code;
-  do {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let body = '';
-    for (let i = 0; i < 6; i++) body += chars[Math.floor(Math.random() * chars.length)];
-    code = 'BCM-' + body;
-  } while (existing.has(code));
+/** Generate a BCM redemption code: 3 uppercase letters + dash + 6 alphanumeric chars */
+function generateCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const prefix = Array.from({length:3}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+  const body   = Array.from({length:6}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+  const code   = `${prefix}-${body}`;
+  if (codeIndex.has(code)) return generateCode(); // collision-safe
   return code;
 }
 
-// ── HTTP HELPERS ──────────────────────────────────────────────────────────────
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', chunk => {
-      size += chunk.length;
-      if (size > MAX_BODY) { reject(new Error('Request too large')); return; }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+function signToken(userId) {
+  return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
-function parseMultipart(buffer, boundary) {
-  const result = { fields: {}, files: {} };
-  const sep = Buffer.from('--' + boundary);
-  const parts = [];
-  let start = 0;
-
-  while (true) {
-    const idx = buffer.indexOf(sep, start);
-    if (idx === -1) break;
-    const end = buffer.indexOf(sep, idx + sep.length);
-    if (end === -1) break;
-    parts.push(buffer.slice(idx + sep.length + 2, end - 2));
-    start = end;
-  }
-
-  for (const part of parts) {
-    const headerEnd = part.indexOf('\r\n\r\n');
-    if (headerEnd === -1) continue;
-    const headerStr = part.slice(0, headerEnd).toString();
-    const body = part.slice(headerEnd + 4);
-
-    const nameMatch = headerStr.match(/name="([^"]+)"/);
-    const filenameMatch = headerStr.match(/filename="([^"]+)"/);
-    const ctMatch = headerStr.match(/Content-Type:\s*([^\r\n]+)/i);
-
-    if (!nameMatch) continue;
-    const name = nameMatch[1];
-
-    if (filenameMatch) {
-      result.files[name] = {
-        filename: filenameMatch[1],
-        mimetype: ctMatch ? ctMatch[1].trim() : 'application/octet-stream',
-        data: body,
-      };
-    } else {
-      result.fields[name] = body.toString().trim();
-    }
-  }
-  return result;
-}
-
-function send(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-function authMiddleware(req) {
-  const auth = req.headers['authorization'] || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return null;
-  const payload = verifyJWT(token);
-  return payload ? payload.userId : null;
-}
-
-// ── ROUTES ────────────────────────────────────────────────────────────────────
-const routes = {};
-
-function route(method, path, handler) {
-  routes[`${method}:${path}`] = handler;
-}
-
-// GET /health
-route('GET', '/health', async (req, res) => {
-  send(res, 200, { status: 'ok' });
-});
-route('POST', '/auth/register', async (req, res) => {
-  const buf = await readBody(req);
-  const { pin } = JSON.parse(buf.toString());
-  if (!/^\d{6}$/.test(pin)) return send(res, 400, { error: 'PIN must be exactly 6 digits' });
-  const db = loadDB();
-  const id = uuid();
-  const login_id = uniqueLoginId();
-  db.users[id] = { id, login_id, pin_hash: hashPin(pin), created_at: new Date().toISOString() };
-  saveDB(db);
-  const token = signJWT({ userId: id });
-  send(res, 201, { token, login_id });
-});
-
-// POST /auth/login
-route('POST', '/auth/login', async (req, res) => {
-  const buf = await readBody(req);
-  const { login_id, pin } = JSON.parse(buf.toString());
-  if (!login_id || !pin) return send(res, 400, { error: 'Login ID and PIN are required' });
-  const db = loadDB();
-  const user = Object.values(db.users).find(u => u.login_id === login_id);
-  if (!user || !checkPin(String(pin), user.pin_hash)) return send(res, 401, { error: 'Invalid Login ID or PIN' });
-  const token = signJWT({ userId: user.id });
-  send(res, 200, { token, login_id: user.login_id });
-});
-
-// GET /profile
-route('GET', '/profile', async (req, res) => {
-  const userId = authMiddleware(req);
-  if (!userId) return send(res, 401, { error: 'Unauthorized' });
-  const db = loadDB();
-  const user = db.users[userId];
-  if (!user) return send(res, 404, { error: 'User not found' });
-  const allMsgs = Object.values(db.messages).filter(m => m.user_id === userId && !m.deleted);
-  const now = Date.now();
-  const unredeemedMsgs = allMsgs.filter(m => !db.redemptions.some(r => r.message_id === m.id));
-  const activeMsgs = unredeemedMsgs.filter(m => !m.expires_at || new Date(m.expires_at).getTime() >= now);
-  const totalRedemptions = db.redemptions.filter(r => allMsgs.some(m => m.id === r.message_id)).length;
-  send(res, 200, {
-    login_id: user.login_id,
-    total_messages: allMsgs.length,
-    active_messages: activeMsgs.length,
-    total_redemptions: totalRedemptions,
-    created_at: user.created_at,
-  });
-});
-
-// GET /messages
-route('GET', '/messages', async (req, res) => {
-  const userId = authMiddleware(req);
-  if (!userId) return send(res, 401, { error: 'Unauthorized' });
-  const db = loadDB();
-  const now = Date.now();
-  const msgs = Object.values(db.messages)
-    .filter(m => m.user_id === userId && !m.deleted)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    .map(m => {
-      const redeemed = db.redemptions.some(r => r.message_id === m.id);
-      const isExpired = m.expires_at && new Date(m.expires_at).getTime() < now;
-      return {
-        id: m.id,
-        message_type: m.message_type,
-        redemption_code: m.redemption_code,
-        one_time_view: m.one_time_view,
-        expires_at: m.expires_at,
-        created_at: m.created_at,
-        is_active: !redeemed && !isExpired,
-        redeemed,
-        expired: isExpired,
-      };
-    });
-  send(res, 200, { messages: msgs });
-});
-
-// POST /messages/text
-route('POST', '/messages/text', async (req, res) => {
-  const userId = authMiddleware(req);
-  if (!userId) return send(res, 401, { error: 'Unauthorized' });
-  const buf = await readBody(req);
-  const { text_content, one_time_view, expiry_ms } = JSON.parse(buf.toString());
-  if (!text_content || !text_content.trim()) return send(res, 400, { error: 'Message cannot be empty' });
-  const db = loadDB();
-  const id = uuid();
-  const code = uniqueCode();
-  const expires_at = expiry_ms && expiry_ms !== 'never'
-    ? new Date(Date.now() + parseInt(expiry_ms)).toISOString() : null;
-  db.messages[id] = {
-    id, user_id: userId, message_type: 'text',
-    text_content: text_content.trim(), media_file: null,
-    redemption_code: code, one_time_view: !!one_time_view,
-    expires_at, created_at: new Date().toISOString(), deleted: false,
-  };
-  saveDB(db);
-  send(res, 201, { redemption_code: code, id });
-});
-
-// POST /messages/media  (multipart/form-data)
-route('POST', '/messages/media', async (req, res) => {
-  const userId = authMiddleware(req);
-  if (!userId) return send(res, 401, { error: 'Unauthorized' });
-  const ct = req.headers['content-type'] || '';
-  const boundaryMatch = ct.match(/boundary=([^\s;]+)/);
-  if (!boundaryMatch) return send(res, 400, { error: 'Missing multipart boundary' });
-  const buf = await readBody(req);
-  const parsed = parseMultipart(buf, boundaryMatch[1]);
-  const file = parsed.files['file'];
-  if (!file) return send(res, 400, { error: 'No file uploaded' });
-  if (file.data.length > 10 * 1024 * 1024) return send(res, 400, { error: 'File too large (max 10 MB)' });
-
-  const ext = path.extname(file.filename) || '.bin';
-  const fileId = uuid();
-  const filename = fileId + ext;
-  fs.writeFileSync(path.join(UPLOADS_DIR, filename), file.data);
-
-  const db = loadDB();
-  const id = uuid();
-  const code = uniqueCode();
-  const message_type = file.mimetype.startsWith('image/') ? 'image' : 'video';
-  const expiry_ms = parsed.fields['expiry_ms'];
-  const expires_at = expiry_ms && expiry_ms !== 'never'
-    ? new Date(Date.now() + parseInt(expiry_ms)).toISOString() : null;
-  db.messages[id] = {
-    id, user_id: userId, message_type,
-    text_content: null, media_file: filename, media_mime: file.mimetype,
-    redemption_code: code, one_time_view: parsed.fields['one_time_view'] === 'true',
-    expires_at, created_at: new Date().toISOString(), deleted: false,
-  };
-  saveDB(db);
-  send(res, 201, { redemption_code: code, id });
-});
-
-// POST /redeem
-route('POST', '/redeem', async (req, res) => {
-  const buf = await readBody(req);
-  const { code } = JSON.parse(buf.toString());
-  if (!code) return send(res, 400, { error: 'Code is required' });
-
-  let raw = code.toUpperCase().replace(/[\s-]/g, '');
-  let normalized;
-  if (/^BCM[A-Z0-9]{6}$/.test(raw)) {
-    normalized = 'BCM-' + raw.slice(3);
-  } else if (/^BCM-[A-Z0-9]{6}$/.test(code.toUpperCase().trim())) {
-    normalized = code.toUpperCase().trim();
-  } else {
-    return send(res, 400, { error: 'Invalid code format — must be BCM-XXXXXX' });
-  }
-
-  const db = loadDB();
-  const msg = Object.values(db.messages).find(m => m.redemption_code === normalized);
-  if (!msg || msg.deleted) return send(res, 404, { error: 'Invalid code — transmission not found' });
-  if (msg.expires_at && new Date(msg.expires_at).getTime() < Date.now())
-    return send(res, 410, { error: 'This transmission has expired' });
-  if (msg.one_time_view && db.redemptions.some(r => r.message_id === msg.id))
-    return send(res, 410, { error: 'This transmission has already been redeemed' });
-
-  db.redemptions.push({ id: uuid(), message_id: msg.id, redeemed_at: new Date().toISOString() });
-  if (msg.one_time_view) db.messages[msg.id].deleted = true;
-  saveDB(db);
-
-  const response = {
-    message_type: msg.message_type,
-    one_time_view: msg.one_time_view,
-    text_content: msg.text_content || null,
-    media_mime: msg.media_mime || null,
-    media_data: null,
-  };
-
-  // For media, return base64 data URI
-  if (msg.media_file) {
-    const filepath = path.join(UPLOADS_DIR, msg.media_file);
-    if (fs.existsSync(filepath)) {
-      const data = fs.readFileSync(filepath);
-      response.media_data = `data:${msg.media_mime};base64,${data.toString('base64')}`;
-    }
-  }
-
-  send(res, 200, response);
-});
-
-// GET /uploads/:filename  (serve media files directly)
-function serveUpload(req, res, filename) {
-  const filepath = path.join(UPLOADS_DIR, path.basename(filename));
-  if (!fs.existsSync(filepath)) return send(res, 404, { error: 'File not found' });
-  const ext = path.extname(filename).toLowerCase();
-  const mimes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm' };
-  const mime = mimes[ext] || 'application/octet-stream';
-  const data = fs.readFileSync(filepath);
-  res.writeHead(200, { 'Content-Type': mime, 'Content-Length': data.length, 'Access-Control-Allow-Origin': '*' });
-  res.end(data);
-}
-
-// ── MAIN REQUEST HANDLER ──────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  const parsed = url.parse(req.url);
-  const pathname = parsed.pathname;
-
-  // CORS preflight
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    });
-    return res.end();
-  }
-
-  // Serve uploaded files
-  if (req.method === 'GET' && pathname.startsWith('/uploads/')) {
-    return serveUpload(req, res, pathname.slice(9));
-  }
-
-  // Serve frontend HTML
-  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-    const htmlPath = fs.existsSync(path.join(__dirname, 'public', 'index.html')) ? path.join(__dirname, 'public', 'index.html') : path.join(__dirname, 'index.html');
-    if (fs.existsSync(htmlPath)) {
-      const html = fs.readFileSync(htmlPath);
-      res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': html.length });
-      return res.end(html);
-    }
-  }
-
-  const handler = routes[`${req.method}:${pathname}`];
-  if (!handler) return send(res, 404, { error: 'Route not found' });
-
+function requireAuth(req, res, next) {
+  const header = req.headers['authorization'] || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    await handler(req, res);
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = users.get(payload.sub);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    req.user = user;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+/** Read uploaded file as a base64 data URL so the frontend can render it directly */
+function fileToDataUrl(filePath, mimetype) {
+  const buf = fs.readFileSync(filePath);
+  return `data:${mimetype};base64,${buf.toString('base64')}`;
+}
+
+function isExpired(msg) {
+  if (!msg.expiry_at) return false;
+  return new Date() > new Date(msg.expiry_at);
+}
+
+/** Compute derived stats for a user */
+function userStats(userId) {
+  let total = 0, active = 0, redemptions = 0;
+  for (const m of messages.values()) {
+    if (m.user_id !== userId) continue;
+    total++;
+    if (m.redeemed) { redemptions++; continue; }
+    if (!isExpired(m)) active++;
+  }
+  return { total_messages: total, active_messages: active, total_redemptions: redemptions };
+}
+
+// ── MULTER (file upload) ───────────────────────────────────────────────────────
+const storage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename:    (_, file, cb) => cb(null, `${uuidv4()}${path.extname(file.originalname)}`),
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_MB * 1024 * 1024 },
+  fileFilter(_, file, cb) {
+    const allowed = /image\/(jpeg|png|gif|webp)|video\/(mp4|webm|ogg)/;
+    if (allowed.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only images and videos are allowed'));
+  },
+});
+
+// ── APP ───────────────────────────────────────────────────────────────────────
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// Serve the frontend HTML
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /auth/register
+ * Body: { pin: "123456" }
+ * Creates a new user with a generated login_id.
+ */
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || !/^\d{6}$/.test(String(pin))) {
+      return res.status(400).json({ error: 'PIN must be exactly 6 digits' });
+    }
+    const pin_hash  = await bcrypt.hash(String(pin), BCRYPT_ROUNDS);
+    const id        = uuidv4();
+    const login_id  = generateLoginId();
+    const created_at = new Date().toISOString();
+
+    users.set(id, { id, login_id, pin_hash, created_at });
+
+    const token = signToken(id);
+    return res.status(201).json({ token, login_id });
   } catch (err) {
-    console.error(`[ERROR] ${req.method} ${pathname}:`, err.message);
-    send(res, 500, { error: err.message || 'Internal server error' });
+    console.error('/auth/register', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🔐 BCM Backend running on http://localhost:${PORT}`);
-  console.log(`   Data stored in: ${DB_FILE}`);
-  console.log(`   Uploads stored in: ${UPLOADS_DIR}\n`);
+/**
+ * POST /auth/login
+ * Body: { login_id: "...", pin: "123456" }
+ */
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { login_id, pin } = req.body;
+    if (!login_id || !pin) {
+      return res.status(400).json({ error: 'login_id and pin are required' });
+    }
+
+    let found = null;
+    for (const u of users.values()) {
+      if (u.login_id === login_id) { found = u; break; }
+    }
+    if (!found) return res.status(401).json({ error: 'Invalid Login ID or PIN' });
+
+    const ok = await bcrypt.compare(String(pin), found.pin_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid Login ID or PIN' });
+
+    const token = signToken(found.id);
+    return res.json({ token, login_id: found.login_id });
+  } catch (err) {
+    console.error('/auth/login', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 });
+
+// ── PROFILE ───────────────────────────────────────────────────────────────────
+
+/**
+ * GET /profile
+ * Returns the authenticated user's profile + stats.
+ */
+app.get('/profile', requireAuth, (req, res) => {
+  const { id, login_id, created_at } = req.user;
+  const stats = userStats(id);
+  return res.json({ login_id, created_at, ...stats });
+});
+
+// ── MESSAGES ──────────────────────────────────────────────────────────────────
+
+/**
+ * GET /messages
+ * Returns all messages belonging to the authenticated user (newest first).
+ */
+app.get('/messages', requireAuth, (req, res) => {
+  const result = [];
+  for (const m of messages.values()) {
+    if (m.user_id !== req.user.id) continue;
+    result.push(publicMessage(m));
+  }
+  result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  return res.json({ messages: result });
+});
+
+/** Strip internal fields before sending to client */
+function publicMessage(m) {
+  return {
+    id:               m.id,
+    message_type:     m.message_type,
+    redemption_code:  m.redemption_code,
+    one_time_view:    m.one_time_view,
+    expiry_at:        m.expiry_at,
+    created_at:       m.created_at,
+    redeemed:         m.redeemed,
+    redeemed_at:      m.redeemed_at || null,
+    expired:          isExpired(m),
+  };
+}
+
+/**
+ * POST /messages/text
+ * Auth required.
+ * Body: { text_content, one_time_view, expiry_ms }
+ *   expiry_ms: number of ms from now, or "never" / 0 for no expiry.
+ */
+app.post('/messages/text', requireAuth, (req, res) => {
+  try {
+    const { text_content, one_time_view, expiry_ms } = req.body;
+    if (!text_content || !text_content.trim()) {
+      return res.status(400).json({ error: 'text_content is required' });
+    }
+
+    const id = uuidv4();
+    const code = generateCode();
+    const expiry_at = resolveExpiry(expiry_ms);
+
+    const msg = {
+      id, user_id: req.user.id,
+      message_type: 'text',
+      text_content: text_content.trim(),
+      one_time_view: !!one_time_view,
+      expiry_at,
+      created_at: new Date().toISOString(),
+      redemption_code: code,
+      redeemed: false,
+    };
+
+    messages.set(id, msg);
+    codeIndex.set(code, id);
+
+    return res.status(201).json({ redemption_code: code });
+  } catch (err) {
+    console.error('/messages/text', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/media
+ * Auth required. Multipart form.
+ * Fields: file, one_time_view, expiry_ms
+ */
+app.post('/messages/media', requireAuth, upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const { one_time_view, expiry_ms } = req.body;
+    const message_type = req.file.mimetype.startsWith('image/') ? 'image' : 'video';
+    const id   = uuidv4();
+    const code = generateCode();
+    const expiry_at = resolveExpiry(expiry_ms);
+
+    const msg = {
+      id, user_id: req.user.id,
+      message_type,
+      file_path: req.file.path,
+      file_mimetype: req.file.mimetype,
+      one_time_view: one_time_view === 'true' || one_time_view === true,
+      expiry_at,
+      created_at: new Date().toISOString(),
+      redemption_code: code,
+      redeemed: false,
+    };
+
+    messages.set(id, msg);
+    codeIndex.set(code, id);
+
+    return res.status(201).json({ redemption_code: code });
+  } catch (err) {
+    console.error('/messages/media', err);
+    return res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+// ── REDEEM ────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /redeem
+ * Auth required.
+ * Body: { code: "ABC-123456" }
+ * Returns the message content (text or base64 media_data).
+ */
+app.post('/redeem', requireAuth, (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'code is required' });
+
+    const normalised = String(code).trim().toUpperCase();
+    const msgId = codeIndex.get(normalised);
+    if (!msgId) return res.status(404).json({ error: 'Invalid or unknown code' });
+
+    const msg = messages.get(msgId);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    if (msg.redeemed) return res.status(410).json({ error: 'This code has already been redeemed' });
+    if (isExpired(msg)) return res.status(410).json({ error: 'This code has expired' });
+
+    // Build response payload
+    const payload = {
+      message_type: msg.message_type,
+      one_time_view: msg.one_time_view,
+    };
+
+    if (msg.message_type === 'text') {
+      payload.text_content = msg.text_content;
+    } else {
+      // Inline base64 so frontend renders without a separate file endpoint
+      payload.media_data = fileToDataUrl(msg.file_path, msg.file_mimetype);
+    }
+
+    // Mark redeemed for one-time-view
+    if (msg.one_time_view) {
+      msg.redeemed   = true;
+      msg.redeemed_at = new Date().toISOString();
+      // Optionally delete the file from disk
+      if (msg.file_path && fs.existsSync(msg.file_path)) {
+        fs.unlink(msg.file_path, () => {});
+      }
+    }
+
+    return res.json(payload);
+  } catch (err) {
+    console.error('/redeem', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+
+/**
+ * Convert expiry_ms (number of milliseconds) into an ISO expiry timestamp.
+ * "never", 0, or missing → null (no expiry).
+ */
+function resolveExpiry(expiry_ms) {
+  const ms = Number(expiry_ms);
+  if (!ms || ms <= 0 || expiry_ms === 'never') return null;
+  return new Date(Date.now() + ms).toISOString();
+}
+
+// ── 404 / ERROR ───────────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
+
+// ── START ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`\n  BCM backend running → http://localhost:${PORT}`);
+  console.log(`  Serve the frontend HTML from ./public/index.html\n`);
+});
+
+module.exports = app; // for testing
