@@ -178,7 +178,10 @@ function route(method, path, handler) {
   routes[`${method}:${path}`] = handler;
 }
 
-// POST /auth/register
+// GET /health
+route('GET', '/health', async (req, res) => {
+  send(res, 200, { status: 'ok' });
+});
 route('POST', '/auth/register', async (req, res) => {
   const buf = await readBody(req);
   const { pin } = JSON.parse(buf.toString());
@@ -410,7 +413,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🔐 BCM Backend running on http://localhost:${PORT}`);
   console.log(`   Data stored in: ${DB_FILE}`);
   console.log(`   Uploads stored in: ${UPLOADS_DIR}\n`);
